@@ -1,0 +1,21 @@
+manifestVersion: 1
+name: "@mgreten/github-file-track"
+version: "2026.05.29.1"
+description: >
+  Track files in GitHub repositories and materialize them on the local
+  filesystem, deduplicated on the upstream Git blob SHA. One sync call fans out
+  across any number of {repo, ref, srcPath, destPath} targets via the gh CLI,
+  rewriting each destination only when the upstream content changed or the local
+  file is missing. A composable primitive for keeping a local copy of a shared
+  skill, snapshot, or config fresh.
+
+repository: https://github.com/meagerfindings/swamp-github-file-track
+
+models:
+  - github_file_track.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+platforms: []
