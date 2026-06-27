@@ -273,7 +273,7 @@ async function syncOne(
  */
 export const model = {
   type: "@mgreten/github-file-track",
-  version: "2026.05.29.1",
+  version: "2026.06.27.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     "syncRecord": {
