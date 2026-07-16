@@ -201,7 +201,7 @@ async function fetchFile(
 }
 
 /** Decode a base64 string to bytes without relying on `atob` charcode quirks. */
-function base64ToBytes(b64: string): Uint8Array {
+export function base64ToBytes(b64: string): Uint8Array {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
