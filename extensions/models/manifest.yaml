@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/github-file-track"
-version: "2026.06.27.1"
+version: "2026.07.16.1"
 description: >
   Track files in GitHub repositories and materialize them on the local
   filesystem, deduplicated on the upstream Git blob SHA. One sync call fans out
