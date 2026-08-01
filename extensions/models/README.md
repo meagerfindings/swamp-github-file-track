@@ -66,8 +66,35 @@ For each target, `sync`:
    file is missing (so a deleted copy is restored). Otherwise reports
    `unchanged` and writes nothing.
 
+## Failure handling
+
 `Promise.allSettled` isolates targets — one failing fetch (bad ref, missing
-path, auth error) is logged and skipped without aborting the others.
+path, auth error) does not abort the others, so a batch still syncs everything
+it can. Once the batch finishes, `sync` **fails** if any target failed.
+
+That matters because a failed target leaves its destination file **untouched,
+not empty**. Anything reading that file afterwards silently reads stale content,
+so a `sync` that reported success would be indistinguishable from one that
+genuinely had nothing to do.
+
+Every run records the outcome either way:
+
+```jsonc
+// syncSummary — total always equals changed + unchanged + failed
+{ "total": 3, "changed": 1, "unchanged": 1, "failed": 1,
+  "failures": [{ "repo": "owner/repo", "srcPath": "a.md",
+                 "destPath": "/tmp/a.md", "error": "gh api ... (HTTP 401)" }] }
+```
+
+The summary is written **before** the error is raised, so the detail is
+inspectable with `swamp data get <model> <summary>` even on a failed run.
+
+Pass `continueOnError: true` to report success despite failures — only do this
+if you inspect `syncSummary.failed` yourself:
+
+```bash
+swamp model method run file-track sync --input continueOnError=true
+```
 
 ## Limits
 
@@ -81,7 +108,7 @@ path, auth error) is logged and skipped without aborting the others.
 | Resource      | Description                                                        |
 | ------------- | ----------------------------------------------------------------- |
 | `syncRecord`  | Per-destination record: `blobSha`, `changed`, `reason`, `bytes`.  |
-| `syncSummary` | Aggregate per run: `total`, `changed`, `unchanged`, `changedPaths`. |
+| `syncSummary` | Aggregate per run: `total`, `changed`, `unchanged`, `failed`, `failures`, `changedPaths`. |
 
 ## License
 

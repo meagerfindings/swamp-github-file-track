@@ -73,6 +73,21 @@ const SyncRecordSchema = z.object({
   syncedAt: z.string(),
 });
 
+/**
+ * A target that could not be synced, recorded so the failure is inspectable
+ * after the fact rather than only existing as a log line.
+ */
+const SyncFailureSchema = z.object({
+  /** GitHub repository the file was to be tracked from. */
+  repo: z.string(),
+  /** Source path inside the repository. */
+  srcPath: z.string(),
+  /** Local destination path that was NOT updated. */
+  destPath: z.string(),
+  /** The error that prevented the sync. */
+  error: z.string(),
+});
+
 /** Aggregate summary across all targets in one `sync` invocation. */
 const SyncSummarySchema = z.object({
   /** Total targets processed. */
@@ -81,6 +96,13 @@ const SyncSummarySchema = z.object({
   changed: z.number(),
   /** Targets skipped because the upstream SHA matched the last sync. */
   unchanged: z.number(),
+  /**
+   * Targets whose fetch failed. Their destination files were left untouched,
+   * so any consumer reading them is reading stale content.
+   */
+  failed: z.number().default(0),
+  /** Detail for each failed target. */
+  failures: z.array(SyncFailureSchema).default([]),
   /** Destination paths that were (re)written this run. */
   changedPaths: z.array(z.string()),
   /** ISO-8601 timestamp of this sync run. */
@@ -91,6 +113,13 @@ const SyncSummarySchema = z.object({
 
 type Target = z.infer<typeof TargetSchema>;
 type SyncRecord = z.infer<typeof SyncRecordSchema>;
+type SyncFailure = z.infer<typeof SyncFailureSchema>;
+type SyncSummary = z.infer<typeof SyncSummarySchema>;
+
+/** Outcome of one target: either a persisted record or a captured failure. */
+export type SyncOutcome =
+  | { ok: true; record: SyncRecord }
+  | { ok: false; failure: SyncFailure };
 
 interface CmdResult {
   success: boolean;
@@ -160,11 +189,52 @@ export function decideSync(
 }
 
 /**
+ * Pure aggregation: fold per-target outcomes into the run summary.
+ *
+ * Counts are derived from the outcomes themselves rather than from the number
+ * of records written, so a failed target can never be silently absorbed into
+ * the `unchanged` bucket. `total` always equals `changed + unchanged + failed`.
+ */
+export function buildSummary(
+  outcomes: SyncOutcome[],
+  syncedAt: string,
+): SyncSummary {
+  const changedPaths: string[] = [];
+  const failures: SyncFailure[] = [];
+  let changed = 0;
+  let unchanged = 0;
+
+  for (const outcome of outcomes) {
+    if (!outcome.ok) {
+      failures.push(outcome.failure);
+      continue;
+    }
+    if (outcome.record.changed) {
+      changed++;
+      changedPaths.push(outcome.record.destPath);
+    } else {
+      unchanged++;
+    }
+  }
+
+  return SyncSummarySchema.parse({
+    total: outcomes.length,
+    changed,
+    unchanged,
+    failed: failures.length,
+    failures,
+    changedPaths,
+    syncedAt,
+  });
+}
+
+/**
  * Fetch a file's blob SHA and decoded text from GitHub via the `gh` CLI.
  * Throws a descriptive error (carrying `gh`'s stderr) when the file cannot be
  * read — missing path, bad ref, auth failure, or a file too large for the
  * contents API. The caller's `Promise.allSettled` isolates the failure so other
- * targets still sync.
+ * targets still sync; the run as a whole still fails afterwards unless
+ * `continueOnError` is set.
  */
 async function fetchFile(
   target: Target,
@@ -297,13 +367,20 @@ export const model = {
         "Fetch each tracked file from GitHub and write it locally when the " +
         "upstream blob SHA changed (or the destination is missing). Fans out " +
         "across all targets in a single execution. Pass `targets` to override " +
-        "the instance default.",
+        "the instance default. Fails if any target could not be fetched, " +
+        "unless `continueOnError` is set.",
       arguments: z.object({
         /** Targets to sync; defaults to the instance's `globalArgs.targets`. */
         targets: z.array(TargetSchema).optional(),
+        /**
+         * Report success even when some targets failed. Their destination files
+         * are left stale, so only set this when the caller inspects
+         * `syncSummary.failed` itself.
+         */
+        continueOnError: z.boolean().default(false),
       }),
       execute: async (
-        args: { targets?: Target[] },
+        args: { targets?: Target[]; continueOnError?: boolean },
         context: {
           globalArgs: z.infer<typeof GlobalArgsSchema>;
           writeResource: (
@@ -317,6 +394,7 @@ export const model = {
           logger: {
             info: (msg: string, props?: Record<string, unknown>) => void;
             warning: (msg: string, props?: Record<string, unknown>) => void;
+            error: (msg: string, props?: Record<string, unknown>) => void;
           };
         },
       ): Promise<{ dataHandles: { name: string }[] }> => {
@@ -333,8 +411,7 @@ export const model = {
 
         const syncedAt = new Date().toISOString();
         const handles: { name: string }[] = [];
-        const changedPaths: string[] = [];
-        let changedCount = 0;
+        const outcomes: SyncOutcome[] = [];
 
         // Fan out: process every target in one execution under one lock.
         const results = await Promise.allSettled(
@@ -353,18 +430,37 @@ export const model = {
 
         for (let i = 0; i < results.length; i++) {
           const result = results[i];
+          const target = targets[i];
           if (result.status === "rejected") {
-            context.logger.warning("github-file-track: target failed: {err}", {
-              err: String(result.reason),
-              target: targets[i].destPath,
+            // `error`, not `warning`: a target that did not sync leaves its
+            // destination file stale, which is a failure however the run ends.
+            //
+            // NB: this line is for severity correctness, not for visibility.
+            // Verified against swamp CLI 20260801: only `logger.info` is
+            // rendered in method/workflow output — `warning` and `error` are
+            // both swallowed. Observability therefore comes from the thrown
+            // error and the `failed`/`failures` fields below, never from a log
+            // line a caller might not see.
+            context.logger.error(
+              "github-file-track: FAILED {destPath}: {err}",
+              {
+                err: String(result.reason),
+                destPath: target.destPath,
+              },
+            );
+            outcomes.push({
+              ok: false,
+              failure: {
+                repo: target.repo,
+                srcPath: target.srcPath,
+                destPath: target.destPath,
+                error: String(result.reason),
+              },
             });
             continue;
           }
           const { slug, record } = result.value;
-          if (record.changed) {
-            changedCount++;
-            changedPaths.push(record.destPath);
-          }
+          outcomes.push({ ok: true, record });
           const handle = await context.writeResource(
             "syncRecord",
             slug,
@@ -381,18 +477,27 @@ export const model = {
           );
         }
 
+        const summary = buildSummary(outcomes, syncedAt);
+
+        // Persist the summary BEFORE throwing, so the failure detail survives
+        // as inspectable data on a failed run rather than only in the logs.
         const summaryHandle = await context.writeResource(
           "syncSummary",
           `summary-${syncedAt}`,
-          SyncSummarySchema.parse({
-            total: targets.length,
-            changed: changedCount,
-            unchanged: handles.length - changedCount,
-            changedPaths,
-            syncedAt,
-          }),
+          summary,
         );
         handles.push(summaryHandle);
+
+        if (summary.failed > 0 && !args.continueOnError) {
+          const detail = summary.failures
+            .map((f) => `${f.repo}:${f.srcPath} -> ${f.destPath}: ${f.error}`)
+            .join("; ");
+          throw new Error(
+            `github-file-track: ${summary.failed} of ${summary.total} ` +
+              `target(s) failed to sync; their destination files are stale. ` +
+              `Set continueOnError to report success anyway. ${detail}`,
+          );
+        }
 
         return { dataHandles: handles };
       },

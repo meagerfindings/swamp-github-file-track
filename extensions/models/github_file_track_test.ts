@@ -1,10 +1,39 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
   base64ToBytes,
+  buildSummary,
   decideSync,
   destSlug,
   model,
+  type SyncOutcome,
 } from "./github_file_track.ts";
+
+/** Build a syncRecord outcome for summary tests. */
+function ok(destPath: string, changed: boolean): SyncOutcome {
+  return {
+    ok: true,
+    record: {
+      repo: "owner/repo",
+      ref: "main",
+      srcPath: "file.md",
+      destPath,
+      label: "",
+      blobSha: "abc123",
+      changed,
+      reason: changed ? "written" : "unchanged",
+      bytes: 4,
+      syncedAt: "2026-07-16T00:00:00.000Z",
+    },
+  };
+}
+
+/** Build a failed-target outcome for summary tests. */
+function bad(destPath: string, error = "gh api failed"): SyncOutcome {
+  return {
+    ok: false,
+    failure: { repo: "owner/repo", srcPath: "file.md", destPath, error },
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // schemas — defaults, contracts, and malformed inputs
@@ -30,6 +59,7 @@ Deno.test("sync arguments: applies main ref and preserves an optional label", ()
       destPath: "/tmp/readme.md",
       label: "documentation",
     }],
+    continueOnError: false,
   });
 });
 
@@ -88,13 +118,100 @@ Deno.test("sync summary schema: validates aggregate fields", () => {
     changedPaths: ["/tmp/file.md"],
     syncedAt: "2026-07-16T00:00:00.000Z",
   };
-  assertEquals(model.resources.syncSummary.schema.parse(summary), summary);
+  // `failed`/`failures` default so summaries written by older versions still
+  // parse.
+  assertEquals(model.resources.syncSummary.schema.parse(summary), {
+    ...summary,
+    failed: 0,
+    failures: [],
+  });
   assertThrows(() =>
     model.resources.syncSummary.schema.parse({
       ...summary,
       changedPaths: "/tmp/file.md",
     })
   );
+});
+
+Deno.test("sync arguments: continueOnError defaults to false", () => {
+  const parsed = model.methods.sync.arguments.parse({});
+  assertEquals(parsed.continueOnError, false);
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// buildSummary — a failed target must never be absorbed as "unchanged"
+// ─────────────────────────────────────────────────────────────────────
+
+const AT = "2026-07-16T00:00:00.000Z";
+
+Deno.test("buildSummary: counts changed and unchanged targets separately", () => {
+  const summary = buildSummary([ok("/tmp/a", true), ok("/tmp/b", false)], AT);
+  assertEquals(summary.total, 2);
+  assertEquals(summary.changed, 1);
+  assertEquals(summary.unchanged, 1);
+  assertEquals(summary.failed, 0);
+  assertEquals(summary.changedPaths, ["/tmp/a"]);
+  assertEquals(summary.failures, []);
+});
+
+Deno.test("buildSummary: a failed target is counted as failed, not unchanged", () => {
+  // The regression: a rejected target previously left `changed` and
+  // `unchanged` both at 0, so `total: 1, changed: 0, unchanged: 0` was the only
+  // hint that nothing had been fetched.
+  const summary = buildSummary([bad("/tmp/a", "gh api 401")], AT);
+  assertEquals(summary.total, 1);
+  assertEquals(summary.changed, 0);
+  assertEquals(summary.unchanged, 0);
+  assertEquals(summary.failed, 1);
+  assertEquals(summary.failures, [{
+    repo: "owner/repo",
+    srcPath: "file.md",
+    destPath: "/tmp/a",
+    error: "gh api 401",
+  }]);
+});
+
+Deno.test("buildSummary: total always equals changed + unchanged + failed", () => {
+  const cases: SyncOutcome[][] = [
+    [],
+    [ok("/tmp/a", true)],
+    [bad("/tmp/a")],
+    [ok("/tmp/a", true), ok("/tmp/b", false), bad("/tmp/c")],
+    [bad("/tmp/a"), bad("/tmp/b")],
+  ];
+  for (const outcomes of cases) {
+    const s = buildSummary(outcomes, AT);
+    assertEquals(
+      s.changed + s.unchanged + s.failed,
+      s.total,
+      `invariant broken for ${outcomes.length} outcome(s)`,
+    );
+  }
+});
+
+Deno.test("buildSummary: a partial failure still reports the successes", () => {
+  const summary = buildSummary(
+    [ok("/tmp/a", true), bad("/tmp/b"), ok("/tmp/c", false)],
+    AT,
+  );
+  assertEquals(summary.total, 3);
+  assertEquals(summary.changed, 1);
+  assertEquals(summary.unchanged, 1);
+  assertEquals(summary.failed, 1);
+  assertEquals(summary.changedPaths, ["/tmp/a"]);
+});
+
+Deno.test("buildSummary: failed targets never appear in changedPaths", () => {
+  const summary = buildSummary([bad("/tmp/a"), bad("/tmp/b")], AT);
+  assertEquals(summary.changedPaths, []);
+  assertEquals(summary.failed, 2);
+});
+
+Deno.test("buildSummary: an empty run is a valid zero summary", () => {
+  const summary = buildSummary([], AT);
+  assertEquals(summary.total, 0);
+  assertEquals(summary.failed, 0);
+  assertEquals(summary.syncedAt, AT);
 });
 
 // ─────────────────────────────────────────────────────────────────────
