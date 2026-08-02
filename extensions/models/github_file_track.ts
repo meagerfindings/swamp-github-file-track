@@ -13,6 +13,7 @@
  * @module
  */
 
+import { dirname, normalize } from "jsr:@std/path@1";
 import { z } from "npm:zod@4";
 
 // --- Schemas ---
@@ -171,6 +172,46 @@ export function destSlug(destPath: string): string {
 }
 
 /**
+ * Reject targets that would race on one destination or overwrite one another's
+ * sync record. Validation happens before fan-out, so invalid batches never
+ * invoke `gh` or touch the filesystem.
+ */
+function validateTargets(targets: Target[]): void {
+  const destinations = new Map<string, string>();
+  const slugs = new Map<string, string>();
+
+  for (const target of targets) {
+    const normalized = normalize(target.destPath);
+    const destinationKey = Deno.build.os === "linux"
+      ? normalized
+      : normalized.toLowerCase();
+    const priorDestination = destinations.get(destinationKey);
+    if (priorDestination !== undefined) {
+      throw new Error(
+        `duplicate destination paths normalize to ${normalized}: ` +
+          `${priorDestination}, ${target.destPath}`,
+      );
+    }
+    destinations.set(destinationKey, target.destPath);
+
+    const slug = destSlug(normalized);
+    if (!slug) {
+      throw new Error(
+        `destination path produces an empty sync-record name: ${target.destPath}`,
+      );
+    }
+    const priorSlugPath = slugs.get(slug);
+    if (priorSlugPath !== undefined) {
+      throw new Error(
+        `destination paths produce the same sync-record name ${slug}: ` +
+          `${priorSlugPath}, ${target.destPath}`,
+      );
+    }
+    slugs.set(slug, target.destPath);
+  }
+}
+
+/**
  * Pure decision: should the destination be (re)written? The file is written
  * when the upstream SHA differs from the prior record, OR when it matches but
  * the destination file is missing on disk (so a deleted local copy is restored
@@ -293,6 +334,55 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 /**
+ * Replace a destination atomically by writing a sibling temporary file and
+ * renaming it only after the complete content is on disk. A failed write or
+ * rename leaves the previous destination untouched and cleans up the temporary
+ * file best-effort.
+ */
+async function writeTextFileAtomically(
+  destPath: string,
+  content: string,
+): Promise<void> {
+  const dir = dirname(destPath);
+  await Deno.mkdir(dir, { recursive: true });
+
+  const tempPath = `${destPath}.tmp-${crypto.randomUUID()}`;
+  let committed = false;
+  let tempFile: Deno.FsFile | null = await Deno.open(tempPath, {
+    createNew: true,
+    write: true,
+    mode: 0o666,
+  });
+
+  try {
+    const bytes = new TextEncoder().encode(content);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = await tempFile.write(bytes.subarray(offset));
+      if (written === 0) {
+        throw new Error(`atomic write made no progress for ${destPath}`);
+      }
+      offset += written;
+    }
+    tempFile.close();
+    tempFile = null;
+    await Deno.rename(tempPath, destPath);
+    committed = true;
+  } finally {
+    if (tempFile !== null) {
+      try {
+        tempFile.close();
+      } catch {
+        // Preserve the write/rename error; cleanup below is best-effort.
+      }
+    }
+    if (!committed) {
+      await Deno.remove(tempPath).catch(() => {});
+    }
+  }
+}
+
+/**
  * Sync one target: fetch upstream, compare against the prior record, and write
  * the destination only when content changed or the file is missing. Returns the
  * record to persist, or throws if the upstream file cannot be fetched.
@@ -310,16 +400,7 @@ async function syncOne(
     destPresent,
   );
 
-  if (decision.write) {
-    // Ensure the destination directory exists, then write.
-    const dir = target.destPath.slice(0, target.destPath.lastIndexOf("/"));
-    if (dir) {
-      await Deno.mkdir(dir, { recursive: true });
-    }
-    await Deno.writeTextFile(target.destPath, fetched.content);
-  }
-
-  return SyncRecordSchema.parse({
+  const record = SyncRecordSchema.parse({
     repo: target.repo,
     ref: target.ref,
     srcPath: target.srcPath,
@@ -331,6 +412,12 @@ async function syncOne(
     bytes: new TextEncoder().encode(fetched.content).length,
     syncedAt,
   });
+
+  if (decision.write) {
+    await writeTextFileAtomically(target.destPath, fetched.content);
+  }
+
+  return record;
 }
 
 // --- Model ---
@@ -342,7 +429,7 @@ async function syncOne(
  */
 export const model = {
   type: "@mgreten/github-file-track",
-  version: "2026.08.02.1",
+  version: "2026.08.02.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     "syncRecord": {
@@ -396,6 +483,7 @@ export const model = {
             "no targets to sync — pass `targets` or set globalArgs.targets",
           );
         }
+        validateTargets(targets);
 
         context.logger.info("github-file-track: syncing {count} target(s)", {
           count: targets.length,
@@ -408,7 +496,7 @@ export const model = {
         // Fan out: process every target in one execution under one lock.
         const results = await Promise.allSettled(
           targets.map(async (target) => {
-            const slug = destSlug(target.destPath);
+            const slug = destSlug(normalize(target.destPath));
             const priorRaw = context.readResource
               ? await context.readResource(slug)
               : null;

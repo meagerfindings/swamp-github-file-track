@@ -60,6 +60,19 @@ async function withFakeGh(
   }
 }
 
+/** Whether a test path exists. */
+async function testPathExists(path: string): Promise<boolean> {
+  try {
+    await Deno.stat(path);
+    return true;
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) {
+      return false;
+    }
+    throw err;
+  }
+}
+
 /** Invoke `sync` while recording every resource write. */
 async function executeSync(
   targets: Array<{
@@ -347,6 +360,102 @@ esac
       assertEquals(writes[1].data.unchanged, 0);
       assertEquals(writes[1].data.failed, 1);
       assertEquals(writes[1].data.changedPaths, [goodPath]);
+      const entries = await Array.fromAsync(Deno.readDir(tempDir));
+      assertEquals(
+        entries.some((entry) => entry.name.startsWith("good.md.tmp-")),
+        false,
+      );
+    },
+  );
+});
+
+Deno.test("sync: rejects duplicate destinations before invoking gh", async () => {
+  await withFakeGh(
+    'touch "$(dirname "$0")/invoked"\nexit 99\n',
+    async (tempDir) => {
+      const writes: ResourceWrite[] = [];
+
+      await assertRejects(
+        () =>
+          executeSync([
+            {
+              repo: "owner/repo",
+              srcPath: "a.md",
+              destPath: `${tempDir}/nested/../same.md`,
+            },
+            {
+              repo: "owner/repo",
+              srcPath: "b.md",
+              destPath: `${tempDir}/same.md`,
+            },
+          ], writes),
+        Error,
+        "duplicate destination paths normalize to",
+      );
+
+      assertEquals(writes, []);
+      assertEquals(await testPathExists(`${tempDir}/invoked`), false);
+    },
+  );
+});
+
+Deno.test("sync: rejects distinct destinations with colliding record slugs", async () => {
+  await withFakeGh(
+    'touch "$(dirname "$0")/invoked"\nexit 99\n',
+    async (tempDir) => {
+      const writes: ResourceWrite[] = [];
+
+      await assertRejects(
+        () =>
+          executeSync([
+            {
+              repo: "owner/repo",
+              srcPath: "a.md",
+              destPath: `${tempDir}/a-b`,
+            },
+            {
+              repo: "owner/repo",
+              srcPath: "b.md",
+              destPath: `${tempDir}/a/b`,
+            },
+          ], writes),
+        Error,
+        "destination paths produce the same sync-record name",
+      );
+
+      assertEquals(writes, []);
+      assertEquals(await testPathExists(`${tempDir}/invoked`), false);
+    },
+  );
+});
+
+Deno.test("sync: failed atomic replacement cleans up its temporary file", async () => {
+  await withFakeGh(
+    'echo \'{"sha":"abc123","content":"ZnJlc2g=","encoding":"base64","type":"file"}\'\n',
+    async (tempDir) => {
+      const destPath = `${tempDir}/destination`;
+      await Deno.mkdir(destPath);
+      const writes: ResourceWrite[] = [];
+
+      await assertRejects(
+        () =>
+          executeSync([{
+            repo: "owner/repo",
+            srcPath: "file.md",
+            destPath,
+          }], writes),
+        Error,
+        "1 of 1 target(s) failed to sync",
+      );
+
+      assertEquals((await Deno.stat(destPath)).isDirectory, true);
+      const entries = await Array.fromAsync(Deno.readDir(tempDir));
+      assertEquals(
+        entries.some((entry) => entry.name.startsWith("destination.tmp-")),
+        false,
+      );
+      assertEquals(writes.map((write) => write.specName), ["syncSummary"]);
+      assertEquals(writes[0].data.failed, 1);
     },
   );
 });

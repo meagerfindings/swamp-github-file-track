@@ -64,7 +64,8 @@ For each target, `sync`:
 2. Compares that SHA against the last `syncRecord` for the destination.
 3. Writes the file when the SHA differs, **or** when it matches but the local
    file is missing (so a deleted copy is restored). Otherwise reports
-   `unchanged` and writes nothing.
+   `unchanged` and writes nothing. Changed content is written to a sibling
+   temporary file and atomically renamed over the destination.
 
 ## Failure handling
 
@@ -95,6 +96,8 @@ inspectable with `swamp data get <model> <summary>` even on a failed run.
   `encoding: "none"` for those and requires the blob API; `sync` raises a clear
   error rather than writing a truncated file.
 - `destPath` should be absolute. Parent directories are created as needed.
+- A batch rejects duplicate normalized destination paths and paths whose
+  filesystem-safe sync-record names would collide.
 
 ## Resources
 
