@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
 import {
   base64ToBytes,
   buildSummary,
@@ -35,6 +35,60 @@ function bad(destPath: string, error = "gh api failed"): SyncOutcome {
   };
 }
 
+interface ResourceWrite {
+  specName: string;
+  instanceName: string;
+  data: Record<string, unknown>;
+}
+
+/** Run a test with a fake `gh` executable first on PATH. */
+async function withFakeGh(
+  script: string,
+  run: (tempDir: string) => Promise<void>,
+): Promise<void> {
+  const tempDir = await Deno.makeTempDir();
+  const oldPath = Deno.env.get("PATH") ?? "";
+  try {
+    const ghPath = `${tempDir}/gh`;
+    await Deno.writeTextFile(ghPath, `#!/bin/sh\n${script}`);
+    await Deno.chmod(ghPath, 0o755);
+    Deno.env.set("PATH", `${tempDir}:${oldPath}`);
+    await run(tempDir);
+  } finally {
+    Deno.env.set("PATH", oldPath);
+    await Deno.remove(tempDir, { recursive: true });
+  }
+}
+
+/** Invoke `sync` while recording every resource write. */
+async function executeSync(
+  targets: Array<{
+    repo: string;
+    ref?: string;
+    srcPath: string;
+    destPath: string;
+  }>,
+  writes: ResourceWrite[],
+): Promise<{ dataHandles: { name: string }[] }> {
+  const args = model.methods.sync.arguments.parse({ targets });
+  return await model.methods.sync.execute(args, {
+    globalArgs: { targets: [] },
+    writeResource: (specName, instanceName, data) => {
+      writes.push({
+        specName,
+        instanceName,
+        data: data as Record<string, unknown>,
+      });
+      return Promise.resolve({ name: instanceName });
+    },
+    logger: {
+      info: () => {},
+      warning: () => {},
+      error: () => {},
+    },
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // schemas — defaults, contracts, and malformed inputs
 // ─────────────────────────────────────────────────────────────────────
@@ -44,23 +98,25 @@ Deno.test("global arguments: defaults targets to an empty list", () => {
 });
 
 Deno.test("sync arguments: applies main ref and preserves an optional label", () => {
-  assertEquals(model.methods.sync.arguments.parse({
-    targets: [{
-      repo: "owner/repo",
-      srcPath: "docs/readme.md",
-      destPath: "/tmp/readme.md",
-      label: "documentation",
-    }],
-  }), {
-    targets: [{
-      repo: "owner/repo",
-      ref: "main",
-      srcPath: "docs/readme.md",
-      destPath: "/tmp/readme.md",
-      label: "documentation",
-    }],
-    continueOnError: false,
-  });
+  assertEquals(
+    model.methods.sync.arguments.parse({
+      targets: [{
+        repo: "owner/repo",
+        srcPath: "docs/readme.md",
+        destPath: "/tmp/readme.md",
+        label: "documentation",
+      }],
+    }),
+    {
+      targets: [{
+        repo: "owner/repo",
+        ref: "main",
+        srcPath: "docs/readme.md",
+        destPath: "/tmp/readme.md",
+        label: "documentation",
+      }],
+    },
+  );
 });
 
 Deno.test("sync arguments: rejects a target missing required paths", () => {
@@ -131,11 +187,6 @@ Deno.test("sync summary schema: validates aggregate fields", () => {
       changedPaths: "/tmp/file.md",
     })
   );
-});
-
-Deno.test("sync arguments: continueOnError defaults to false", () => {
-  const parsed = model.methods.sync.arguments.parse({});
-  assertEquals(parsed.continueOnError, false);
 });
 
 // ─────────────────────────────────────────────────────────────────────
@@ -215,12 +266,100 @@ Deno.test("buildSummary: an empty run is a valid zero summary", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// sync execution — failures persist a summary and fail the method
+// ─────────────────────────────────────────────────────────────────────
+
+Deno.test("sync: failed fetch writes its summary before rejecting", async () => {
+  await withFakeGh(
+    "echo 'gh: Bad credentials (HTTP 401)' >&2\nexit 1\n",
+    async (tempDir) => {
+      const destPath = `${tempDir}/policy.hujson`;
+      await Deno.writeTextFile(destPath, "stale-but-intact");
+      const writes: ResourceWrite[] = [];
+
+      await assertRejects(
+        () =>
+          executeSync([{
+            repo: "owner/private-repo",
+            srcPath: "policy.hujson",
+            destPath,
+          }], writes),
+        Error,
+        "1 of 1 target(s) failed to sync",
+      );
+
+      assertEquals(await Deno.readTextFile(destPath), "stale-but-intact");
+      assertEquals(writes.length, 1);
+      assertEquals(writes[0].specName, "syncSummary");
+      assertEquals(writes[0].data.total, 1);
+      assertEquals(writes[0].data.changed, 0);
+      assertEquals(writes[0].data.unchanged, 0);
+      assertEquals(writes[0].data.failed, 1);
+      assertEquals(writes[0].data.changedPaths, []);
+    },
+  );
+});
+
+Deno.test("sync: partial failure records successes then rejects", async () => {
+  await withFakeGh(
+    `case "$2" in
+  *good.md*)
+    echo '{"sha":"goodsha","content":"ZnJlc2g=","encoding":"base64","type":"file"}'
+    ;;
+  *)
+    echo 'gh: Not Found (HTTP 404)' >&2
+    exit 1
+    ;;
+esac
+`,
+    async (tempDir) => {
+      const goodPath = `${tempDir}/good.md`;
+      const badPath = `${tempDir}/bad.md`;
+      await Deno.writeTextFile(badPath, "stale-but-intact");
+      const writes: ResourceWrite[] = [];
+
+      await assertRejects(
+        () =>
+          executeSync([
+            {
+              repo: "owner/repo",
+              srcPath: "good.md",
+              destPath: goodPath,
+            },
+            {
+              repo: "owner/repo",
+              srcPath: "bad.md",
+              destPath: badPath,
+            },
+          ], writes),
+        Error,
+        "1 of 2 target(s) failed to sync",
+      );
+
+      assertEquals(await Deno.readTextFile(goodPath), "fresh");
+      assertEquals(await Deno.readTextFile(badPath), "stale-but-intact");
+      assertEquals(writes.map((write) => write.specName), [
+        "syncRecord",
+        "syncSummary",
+      ]);
+      assertEquals(writes[1].data.total, 2);
+      assertEquals(writes[1].data.changed, 1);
+      assertEquals(writes[1].data.unchanged, 0);
+      assertEquals(writes[1].data.failed, 1);
+      assertEquals(writes[1].data.changedPaths, [goodPath]);
+    },
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // base64ToBytes — GitHub contents decoding primitive
 // ─────────────────────────────────────────────────────────────────────
 
 Deno.test("base64ToBytes: preserves UTF-8 bytes and accepts embedded newlines once stripped", () => {
   const encoded = "aMOpbGxvIPCfjI0=";
-  const bytes = base64ToBytes(`\n${encoded.slice(0, 8)}\n${encoded.slice(8)}\n`.replace(/\n/g, ""));
+  const bytes = base64ToBytes(
+    `\n${encoded.slice(0, 8)}\n${encoded.slice(8)}\n`.replace(/\n/g, ""),
+  );
   assertEquals(new TextDecoder().decode(bytes), "héllo 🌍");
 });
 
@@ -235,8 +374,8 @@ Deno.test("base64ToBytes: decodes empty content and rejects malformed input", ()
 
 Deno.test("destSlug: replaces path separators and dots with hyphens", () => {
   assertEquals(
-    destSlug("/Users/mat/git/x/.claude/skills/database-scale/stats.md"),
-    "Users-mat-git-x-claude-skills-database-scale-stats-md",
+    destSlug("/Users/alice/git/x/.claude/skills/database-scale/stats.md"),
+    "Users-alice-git-x-claude-skills-database-scale-stats-md",
   );
 });
 

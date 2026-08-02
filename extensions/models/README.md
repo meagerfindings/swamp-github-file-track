@@ -89,13 +89,6 @@ Every run records the outcome either way:
 The summary is written **before** the error is raised, so the detail is
 inspectable with `swamp data get <model> <summary>` even on a failed run.
 
-Pass `continueOnError: true` to report success despite failures — only do this
-if you inspect `syncSummary.failed` yourself:
-
-```bash
-swamp model method run file-track sync --input continueOnError=true
-```
-
 ## Limits
 
 - Files larger than ~1 MB are not supported. The GitHub contents API returns

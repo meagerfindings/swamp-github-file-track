@@ -233,8 +233,7 @@ export function buildSummary(
  * Throws a descriptive error (carrying `gh`'s stderr) when the file cannot be
  * read — missing path, bad ref, auth failure, or a file too large for the
  * contents API. The caller's `Promise.allSettled` isolates the failure so other
- * targets still sync; the run as a whole still fails afterwards unless
- * `continueOnError` is set.
+ * targets still sync; the run as a whole still fails afterwards.
  */
 async function fetchFile(
   target: Target,
@@ -343,7 +342,7 @@ async function syncOne(
  */
 export const model = {
   type: "@mgreten/github-file-track",
-  version: "2026.07.16.1",
+  version: "2026.08.02.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     "syncRecord": {
@@ -367,20 +366,13 @@ export const model = {
         "Fetch each tracked file from GitHub and write it locally when the " +
         "upstream blob SHA changed (or the destination is missing). Fans out " +
         "across all targets in a single execution. Pass `targets` to override " +
-        "the instance default. Fails if any target could not be fetched, " +
-        "unless `continueOnError` is set.",
+        "the instance default. Fails if any target could not be fetched.",
       arguments: z.object({
         /** Targets to sync; defaults to the instance's `globalArgs.targets`. */
         targets: z.array(TargetSchema).optional(),
-        /**
-         * Report success even when some targets failed. Their destination files
-         * are left stale, so only set this when the caller inspects
-         * `syncSummary.failed` itself.
-         */
-        continueOnError: z.boolean().default(false),
       }),
       execute: async (
-        args: { targets?: Target[]; continueOnError?: boolean },
+        args: { targets?: Target[] },
         context: {
           globalArgs: z.infer<typeof GlobalArgsSchema>;
           writeResource: (
@@ -488,14 +480,14 @@ export const model = {
         );
         handles.push(summaryHandle);
 
-        if (summary.failed > 0 && !args.continueOnError) {
+        if (summary.failed > 0) {
           const detail = summary.failures
             .map((f) => `${f.repo}:${f.srcPath} -> ${f.destPath}: ${f.error}`)
             .join("; ");
           throw new Error(
             `github-file-track: ${summary.failed} of ${summary.total} ` +
               `target(s) failed to sync; their destination files are stale. ` +
-              `Set continueOnError to report success anyway. ${detail}`,
+              detail,
           );
         }
 
